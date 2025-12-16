@@ -1,0 +1,204 @@
+name: KeyZero Scanner (Standard Logic)
+
+on:
+  schedule:
+    - cron: '30 */6 * * *' # Run every 6 hours (Offset by 30 mins)
+  workflow_dispatch:
+    inputs:
+      scan_mode:
+        description: 'Scan Mode: "offline" (Fastest, uses DB) or "online" (Electrum)'
+        required: true
+        default: 'offline'
+        type: choice
+        options:
+        - offline
+        - online
+      test_upload:
+        description: 'TEST MODE: Simulate Success to verify Google Drive Upload?'
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  keyzero-scan:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # SPAWN 20 PARALLEL WORKERS AUTOMATICALLY
+        worker_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+    permissions:
+      contents: write
+
+    steps:
+    - name: Set up job
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.14'
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y automake libtool pkg-config libffi-dev
+        pip install -r requirements.txt
+
+    # LOGIC FIX: Determine Mode (Default to 'offline' for Schedule/Cron)
+    - name: Set Scan Mode
+      id: set_mode
+      run: |
+        if [ "${{ github.event_name }}" == "schedule" ]; then
+           echo "MODE=offline" >> $GITHUB_ENV
+           echo "Run detected as SCHEDULE. Defaulting to OFFLINE mode."
+        else
+           echo "MODE=${{ github.event.inputs.scan_mode }}" >> $GITHUB_ENV
+           echo "Run detected as MANUAL. Mode: ${{ github.event.inputs.scan_mode }}"
+        fi
+
+    # SECURE LOADER: Download Script from Cloud (Optional)
+    # If REMOTE_SCRIPT_URL secret is set, it overwrites local .py files
+    - name: Download Secure Script (Stealth Mode)
+      env:
+        REMOTE_URL: ${{ secrets.REMOTE_SCRIPT_URL }}
+        REMOTE_TOKEN: ${{ secrets.REMOTE_AUTH_TOKEN }}
+      if: env.REMOTE_URL != ''
+      run: |
+        echo "Detected Remote Script URL. Downloading payload..."
+        # Using curl with Fail (-f), Silent (-s), Show Error (-S), and Location (-L)
+        # Authentication Header is added if Token exists
+        if [ -n "$REMOTE_TOKEN" ]; then
+           curl -f -s -S -L -H "Authorization: Bearer $REMOTE_TOKEN" "$REMOTE_URL/KeyZeroOffline.py" -o KeyZeroOffline.py
+           curl -f -s -S -L -H "Authorization: Bearer $REMOTE_TOKEN" "$REMOTE_URL/KeyZeroWorker.py" -o KeyZeroWorker.py || true
+        else
+           curl -f -s -S -L "$REMOTE_URL/KeyZeroOffline.py" -o KeyZeroOffline.py
+           curl -f -s -S -L "$REMOTE_URL/KeyZeroWorker.py" -o KeyZeroWorker.py || true
+        fi
+        echo "Payload Downloaded. Local scripts overwritten."
+
+    # CACHE DATABASE (Offline Mode)
+    - name: Cache/Restore DB
+      if: env.MODE == 'offline'
+      id: cache-db
+      uses: actions/cache@v3
+      with:
+        path: KeyZero1/rich_list.txt.gz
+        key: rich-list-db-v1 # Change v1 to force redownload later
+
+    # ---------------------------------------------------------
+    # MODE 1: OFFLINE SPEED SCAN (RAM DB)
+    # ---------------------------------------------------------
+    - name: Run OFFLINE Worker (High Speed)
+      if: github.event.inputs.test_upload != 'true' && env.MODE == 'offline'
+      env:
+        DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      run: |
+        echo "Starting HIGH SPEED Offline Scan..."
+        # Script checks if file exists (restored from cache). If not, it downloads.
+        python -u KeyZeroOffline.py
+
+    # ---------------------------------------------------------
+    # MODE 2: ONLINE ELECTRUM SCAN
+    # ---------------------------------------------------------
+    - name: Run ONLINE Worker (Electrum)
+      if: github.event.inputs.test_upload != 'true' && env.MODE == 'online'
+      run: |
+        echo "Starting Standard Online Scan..."
+        python KeyZeroWorker.py
+
+    # TEST MODE: Create Dummy Treasure (Instant)
+    - name: '[TEST] Simulate Found Key'
+      if: github.event.inputs.test_upload == 'true'
+      run: |
+         echo "TEST SUCCESS! Connection to Google Drive is WORKING." > foundkey.txt
+         echo "ADDR: 1TestAddress123" >> foundkey.txt
+         echo "WIF: 5TestWifKey456" >> foundkey.txt
+         echo "BALANCE: 5000000000" >> foundkey.txt
+         
+         echo " [TEST] Dummy foundkey.txt created."
+
+    # SECURITY: Encrypt Results before Upload
+    - name: Encrypt Found Keys
+      env:
+        GPG_PASS: ${{ secrets.GPG_PASSPHRASE }}
+      run: |
+        if [ -f foundkey.txt ]; then
+           echo " [SEC] Encrypting foundkey.txt..."
+           gpg --batch --yes --passphrase "$GPG_PASS" --symmetric --cipher-algo AES256 -o foundkey.gpg foundkey.txt
+        fi
+
+    # CHECK: Did we find treasure?
+    - name: Check for Treasure
+      id: check_treasure
+      if: always()
+      run: |
+        if [ -f foundkey.gpg ]; then
+          echo "found=true" >> $GITHUB_OUTPUT
+          echo " [!!!] TREASURE DETECTED. PREPARING UPLOAD."
+        else
+          echo "found=false" >> $GITHUB_OUTPUT
+          echo " [INFO] No Key found this run. Skipping Google Drive."
+        fi
+
+    # UPLOAD: Google Drive (Rclone)
+    - name: Setup Rclone
+      if: steps.check_treasure.outputs.found == 'true'
+      run: |
+        sudo -v ; curl https://rclone.org/install.sh | sudo bash
+
+    - name: Upload to Google Drive
+      if: steps.check_treasure.outputs.found == 'true'
+      env:
+        RCLONE_CONF: ${{ secrets.RCLONE_CONFIG_CONTENT }}
+        DRIVE_NAME: ${{ secrets.RCLONE_REMOTE_NAME }}
+        DRIVE_PATH: ${{ secrets.RCLONE_REMOTE_PATH }}
+      run: |
+        # Create config
+        mkdir -p ~/.config/rclone
+        echo "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+        
+        # Set Defaults if Secrets are empty
+        REMOTE="${DRIVE_NAME:-gdrive}"
+        TARGET_PATH="${DRIVE_PATH:-supabase-backups}"
+        
+        echo " [CLOUD] Uploading TREASURE to $REMOTE:$TARGET_PATH..."
+        rclone copy foundkey.gpg "$REMOTE:$TARGET_PATH"
+        echo " [SUCCESS] UPLOADED TO GOOGLE DRIVE!"
+
+    # NOTIFICATION: Send Email (Gmail Recommended)
+    - name: Send Email Notification
+      if: steps.check_treasure.outputs.found == 'true'
+      uses: dawidd6/action-send-mail@v3
+      with:
+        server_address: smtp.gmail.com
+        server_port: 465
+        secure: true
+        username: ${{ secrets.MAIL_USERNAME }}
+        password: ${{ secrets.MAIL_PASSWORD }}
+        subject: "[JACKPOT] KEYZERO FOUND A KEY!"
+        to: ${{ secrets.MAIL_TO }}
+        from: KeyZero Scanner <${{ secrets.MAIL_USERNAME }}>
+        body: |
+          SELAMAT! Script KeyZero baru saja menemukan kandidat Private Key Bitcoin.
+          
+          Detail:
+          - Repo: ${{ github.repository }}
+          - Run ID: ${{ github.run_id }}
+          
+          File terenkripsi (foundkey.gpg) telah diupload ke Google Drive dan dilampirkan di email ini.
+          Silakan decrypt menggunakan GPG Passphrase Anda.
+          
+          Salam,
+          KeyZero Worker
+        attachments: foundkey.gpg
+
+    # UPLOAD: GitHub Artifacts
+    - name: Upload Results (Artifacts)
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: keyzero-results-${{ github.run_id }}
+        path: |
+          foundkey.gpg
+        retention-days: 90
